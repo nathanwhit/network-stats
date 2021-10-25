@@ -1,0 +1,23 @@
+[package]
+name = "network-stats"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+clap = "3.0.0-beta.5"
+color-eyre = "0.5.11"
+futures = "0.3.17"
+hex = "0.4.3"
+prost = "0.9.0"
+rand = "0.6.5"
+secp256k1 = { version = "0.20.3", features = ["rand"] }
+tmq = "0.3.0"
+tokio = { version = "1.12.0", features = ["full"] }
+uuid = { version = "0.8.2", features = ["v4"] }
+zmq = "0.9.2"
+
+[build-dependencies]
+glob = "0.3.0"
+prost-build = "0.9.0"
