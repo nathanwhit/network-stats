@@ -66,8 +66,8 @@ impl ConnectionId {
 pub struct Network {
     context: tmq::Context,
     secret_key: SecretKey,
-    recv_sock: Router,
     connections: HashMap<ConnectionId, Connection>,
+    tx: mpsc::UnboundedSender<NetworkCommand>,
 }
 
 pub struct Connection {
@@ -197,143 +197,67 @@ impl Connection {
                                 }
                             } else {
                                 println!("Non-response message! {:?}", message);
-                                match message.message_type() {
-                                    MessageType::Default => todo!(),
-                                    MessageType::TpRegisterRequest => todo!(),
-                                    MessageType::TpRegisterResponse => todo!(),
-                                    MessageType::TpUnregisterRequest => todo!(),
-                                    MessageType::TpUnregisterResponse => todo!(),
-                                    MessageType::TpProcessRequest => todo!(),
-                                    MessageType::TpProcessResponse => todo!(),
-                                    MessageType::TpStateGetRequest => todo!(),
-                                    MessageType::TpStateGetResponse => todo!(),
-                                    MessageType::TpStateSetRequest => todo!(),
-                                    MessageType::TpStateSetResponse => todo!(),
-                                    MessageType::TpStateDeleteRequest => todo!(),
-                                    MessageType::TpStateDeleteResponse => todo!(),
-                                    MessageType::TpReceiptAddDataRequest => todo!(),
-                                    MessageType::TpReceiptAddDataResponse => todo!(),
-                                    MessageType::TpEventAddRequest => todo!(),
-                                    MessageType::TpEventAddResponse => todo!(),
-                                    MessageType::ClientBatchSubmitRequest => todo!(),
-                                    MessageType::ClientBatchSubmitResponse => todo!(),
-                                    MessageType::ClientBlockListRequest => todo!(),
-                                    MessageType::ClientBlockListResponse => todo!(),
-                                    MessageType::ClientBlockGetByIdRequest => todo!(),
-                                    MessageType::ClientBlockGetResponse => todo!(),
-                                    MessageType::ClientBatchListRequest => todo!(),
-                                    MessageType::ClientBatchListResponse => todo!(),
-                                    MessageType::ClientBatchGetRequest => todo!(),
-                                    MessageType::ClientBatchGetResponse => todo!(),
-                                    MessageType::ClientTransactionListRequest => todo!(),
-                                    MessageType::ClientTransactionListResponse => todo!(),
-                                    MessageType::ClientTransactionGetRequest => todo!(),
-                                    MessageType::ClientTransactionGetResponse => todo!(),
-                                    MessageType::ClientStateCurrentRequest => todo!(),
-                                    MessageType::ClientStateCurrentResponse => todo!(),
-                                    MessageType::ClientStateListRequest => todo!(),
-                                    MessageType::ClientStateListResponse => todo!(),
-                                    MessageType::ClientStateGetRequest => todo!(),
-                                    MessageType::ClientStateGetResponse => todo!(),
-                                    MessageType::ClientBatchStatusRequest => todo!(),
-                                    MessageType::ClientBatchStatusResponse => todo!(),
-                                    MessageType::ClientReceiptGetRequest => todo!(),
-                                    MessageType::ClientReceiptGetResponse => todo!(),
-                                    MessageType::ClientBlockGetByNumRequest => todo!(),
-                                    MessageType::ClientPeersGetRequest => todo!(),
-                                    MessageType::ClientPeersGetResponse => todo!(),
-                                    MessageType::ClientBlockGetByTransactionIdRequest => todo!(),
-                                    MessageType::ClientBlockGetByBatchIdRequest => todo!(),
-                                    MessageType::ClientStatusGetRequest => todo!(),
-                                    MessageType::ClientStatusGetResponse => todo!(),
-                                    MessageType::ClientEventsSubscribeRequest => todo!(),
-                                    MessageType::ClientEventsSubscribeResponse => todo!(),
-                                    MessageType::ClientEventsUnsubscribeRequest => todo!(),
-                                    MessageType::ClientEventsUnsubscribeResponse => todo!(),
-                                    MessageType::ClientEvents => todo!(),
-                                    MessageType::ClientEventsGetRequest => todo!(),
-                                    MessageType::ClientEventsGetResponse => todo!(),
-                                    MessageType::GossipMessage => todo!(),
-                                    MessageType::GossipRegister => todo!(),
-                                    MessageType::GossipUnregister => todo!(),
-                                    MessageType::GossipBlockRequest => todo!(),
-                                    MessageType::GossipBlockResponse => todo!(),
-                                    MessageType::GossipBatchByBatchIdRequest => todo!(),
-                                    MessageType::GossipBatchByTransactionIdRequest => todo!(),
-                                    MessageType::GossipBatchResponse => todo!(),
-                                    MessageType::GossipGetPeersRequest => todo!(),
-                                    MessageType::GossipGetPeersResponse => todo!(),
-                                    MessageType::GossipConsensusMessage => todo!(),
-                                    MessageType::NetworkAck => todo!(),
-                                    MessageType::NetworkConnect => {
-                                        let connect_request: proto::ConnectionRequest =
-                                            message.content.parse_into().unwrap();
-                                        println!("connect request = {:?}", connect_request);
+                                let send_once_and_log =
+                                    |message_type: MessageType, data: Vec<u8>| {
                                         let result = Connection::send_once_with(
-                                            MessageType::AuthorizationConnectionResponse,
-                                            proto::ConnectionResponse {
-                                                status: proto::connection_response::Status::Ok
-                                                    .into(),
-                                                roles: vec![proto::connection_response::RoleEntry { role: proto::RoleType::Network.into(), auth_type: proto::connection_response::AuthorizationType::Trust.into() }],
-                                            }
-                                            .to_bytes(),
+                                            message_type,
+                                            data,
                                             &command_sender,
                                         );
                                         if let Err(e) = result {
                                             println!("Error occurred : {:?}", e);
                                         }
+                                    };
+
+                                let send_response_and_log =
+                                    |message_type: MessageType, data: Vec<u8>| {
+                                        let result = Connection::send_response_with(
+                                            message_type,
+                                            data,
+                                            &message.correlation_id,
+                                            &command_sender,
+                                        );
+                                        if let Err(e) = result {
+                                            println!("Error occurred : {:?}", e);
+                                        }
+                                    };
+                                match message.message_type() {
+                                    MessageType::NetworkConnect => {
+                                        let connect_request: proto::ConnectionRequest =
+                                            message.content.parse_into().unwrap();
+                                        println!("connect request = {:?}", connect_request);
+                                        let response = proto::ConnectionResponse {
+                                            status: proto::connection_response::Status::Ok
+                                                .into(),
+                                            roles: vec![proto::connection_response::RoleEntry { role: proto::RoleType::Network.into(), auth_type: proto::connection_response::AuthorizationType::Trust.into() }],
+                                        };
+                                        send_response_and_log(
+                                            MessageType::AuthorizationConnectionResponse,
+                                            response.to_bytes(),
+                                        );
                                     }
-                                    MessageType::NetworkDisconnect => todo!(),
-                                    MessageType::AuthorizationConnectionResponse => todo!(),
-                                    MessageType::AuthorizationViolation => todo!(),
-                                    MessageType::AuthorizationTrustRequest => todo!(),
-                                    MessageType::AuthorizationTrustResponse => todo!(),
-                                    MessageType::AuthorizationChallengeRequest => todo!(),
-                                    MessageType::AuthorizationChallengeResponse => todo!(),
-                                    MessageType::AuthorizationChallengeSubmit => todo!(),
-                                    MessageType::AuthorizationChallengeResult => todo!(),
-                                    MessageType::PingRequest => todo!(),
-                                    MessageType::PingResponse => todo!(),
-                                    MessageType::ConsensusRegisterRequest => todo!(),
-                                    MessageType::ConsensusRegisterResponse => todo!(),
-                                    MessageType::ConsensusSendToRequest => todo!(),
-                                    MessageType::ConsensusSendToResponse => todo!(),
-                                    MessageType::ConsensusBroadcastRequest => todo!(),
-                                    MessageType::ConsensusBroadcastResponse => todo!(),
-                                    MessageType::ConsensusInitializeBlockRequest => todo!(),
-                                    MessageType::ConsensusInitializeBlockResponse => todo!(),
-                                    MessageType::ConsensusFinalizeBlockRequest => todo!(),
-                                    MessageType::ConsensusFinalizeBlockResponse => todo!(),
-                                    MessageType::ConsensusSummarizeBlockRequest => todo!(),
-                                    MessageType::ConsensusSummarizeBlockResponse => todo!(),
-                                    MessageType::ConsensusCancelBlockRequest => todo!(),
-                                    MessageType::ConsensusCancelBlockResponse => todo!(),
-                                    MessageType::ConsensusCheckBlocksRequest => todo!(),
-                                    MessageType::ConsensusCheckBlocksResponse => todo!(),
-                                    MessageType::ConsensusCommitBlockRequest => todo!(),
-                                    MessageType::ConsensusCommitBlockResponse => todo!(),
-                                    MessageType::ConsensusIgnoreBlockRequest => todo!(),
-                                    MessageType::ConsensusIgnoreBlockResponse => todo!(),
-                                    MessageType::ConsensusFailBlockRequest => todo!(),
-                                    MessageType::ConsensusFailBlockResponse => todo!(),
-                                    MessageType::ConsensusSettingsGetRequest => todo!(),
-                                    MessageType::ConsensusSettingsGetResponse => todo!(),
-                                    MessageType::ConsensusStateGetRequest => todo!(),
-                                    MessageType::ConsensusStateGetResponse => todo!(),
-                                    MessageType::ConsensusBlocksGetRequest => todo!(),
-                                    MessageType::ConsensusBlocksGetResponse => todo!(),
-                                    MessageType::ConsensusChainHeadGetRequest => todo!(),
-                                    MessageType::ConsensusChainHeadGetResponse => todo!(),
-                                    MessageType::ConsensusNotifyPeerConnected => todo!(),
-                                    MessageType::ConsensusNotifyPeerDisconnected => todo!(),
-                                    MessageType::ConsensusNotifyPeerMessage => todo!(),
-                                    MessageType::ConsensusNotifyBlockNew => todo!(),
-                                    MessageType::ConsensusNotifyBlockValid => todo!(),
-                                    MessageType::ConsensusNotifyBlockInvalid => todo!(),
-                                    MessageType::ConsensusNotifyBlockCommit => todo!(),
-                                    MessageType::ConsensusNotifyEngineActivated => todo!(),
-                                    MessageType::ConsensusNotifyEngineDeactivated => todo!(),
-                                    MessageType::ConsensusNotifyAck => todo!(),
+                                    MessageType::PingRequest => {
+                                        let ping_request = message
+                                            .content
+                                            .parse_into::<proto::PingRequest>()
+                                            .unwrap();
+                                        println!("ping request = {:?}", ping_request);
+                                        send_response_and_log(
+                                            MessageType::PingResponse,
+                                            proto::PingResponse::default().to_bytes(),
+                                        );
+                                    }
+                                    MessageType::AuthorizationTrustRequest => {
+                                        let response = proto::AuthorizationTrustResponse {
+                                            roles: vec![proto::RoleType::Network.into()],
+                                        };
+                                        println!("Sending response {:?}", response);
+                                        send_response_and_log(
+                                            MessageType::AuthorizationTrustResponse,
+                                            response.to_bytes(),
+                                        );
+                                    }
+                                    msg => println!("unhandled message type {:?}", msg),
                                 }
                             }
                         }
@@ -425,6 +349,29 @@ impl Connection {
             })
             .map_err(Into::into)
     }
+
+    pub fn send_response_with(
+        message_type: MessageType,
+        data: Vec<u8>,
+        correlation_id: &str,
+        sender: &mpsc::UnboundedSender<Command>,
+    ) -> Result<()> {
+        let message = proto::Message {
+            message_type: message_type.into(),
+            correlation_id: correlation_id.to_owned(),
+            content: data,
+        };
+
+        let message_bytes = message.to_bytes();
+        let message = vec![&message_bytes];
+
+        sender
+            .send(Command::Send {
+                message: message.into(),
+                response_demand: None,
+            })
+            .map_err(Into::into)
+    }
 }
 
 fn correlation_id() -> String {
@@ -446,19 +393,41 @@ impl Connection {
     }
 }
 
+#[derive(Debug)]
+pub enum NetworkCommand {}
+
 impl Network {
     pub fn new(secret_key: SecretKey) -> Result<Self> {
         let context = tmq::Context::new();
         let recv_sock = tmq::router(&context).bind("tcp://0.0.0.0:8801")?;
+        let (tx, rx) = mpsc::unbounded_channel::<NetworkCommand>();
 
-        // let task = tokio::spawn(async move )
+        let task = tokio::spawn(async move {
+            let mut recv_sock = recv_sock;
+            let mut rx = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
+
+            loop {
+                tokio::select! {
+                    incoming = recv_sock.next() => {
+                        println!("Got message on router: {:?}", incoming);
+                    }
+                    command = rx.next() => {
+                        println!("Got command: {:?}", command);
+                    }
+                }
+            }
+        });
 
         Ok(Self {
             context,
-            recv_sock,
             secret_key,
             connections: HashMap::default(),
+            tx,
         })
+    }
+
+    pub fn make_sender(&self) -> mpsc::UnboundedSender<NetworkCommand> {
+        self.tx.clone()
     }
 
     pub fn send_once(
@@ -597,6 +566,22 @@ async fn main() -> Result<()> {
     let mut network = Network::new(key)?;
 
     let id = network.connect_to("tcp://127.0.0.1:8800").await?;
+
+    let response = network
+        .send_request(
+            MessageType::GossipGetPeersRequest,
+            proto::GetPeersRequest::default().to_bytes(),
+            MessageType::GossipGetPeersResponse,
+            id,
+        )?
+        .await?;
+
+    println!("RESPONSE = {:?}", response);
+
+    let peers = response.content.parse_into::<proto::GetPeersResponse>()?;
+    println!("Peers = {:?}", peers);
+
+    loop {}
 
     Ok(())
 }
