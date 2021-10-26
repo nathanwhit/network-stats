@@ -1,6 +1,9 @@
+use std::collections::HashSet;
+
 use clap::Parser;
 
 use ext::{BufExt, MessageExt};
+use networking::ConnectionId;
 use proto::message::MessageType;
 
 use color_eyre::Result;
@@ -13,32 +16,29 @@ pub mod ext;
 pub mod networking;
 pub mod proto;
 
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub struct CreditcoinNode {
+    connection_id: ConnectionId,
+    endpoint: String,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
 
-    let _opts = CliOptions::parse();
+    let opts = CliOptions::parse();
     let mut rng = rand::thread_rng();
     let key = secp256k1::SecretKey::new(&mut rng);
 
-    let mut network = Network::new(key)?;
+    let mut network = Network::with_seeds(key, opts.seeds.as_slice()).await?;
 
-    let id = network.connect_to("tcp://127.0.0.1:8800").await?;
+    let mut updates = network.take_update_rx().unwrap();
 
-    let response = network
-        .send_request(
-            MessageType::GossipGetPeersRequest,
-            proto::GetPeersRequest::default().to_bytes(),
-            id,
-        )?
+    let id = network
+        .connect_to("tcp://creditcoin-test-node.gluwa.com:8800")
         .await?;
 
-    println!("RESPONSE = {:?}", response);
-
-    let ack = response
-        .content
-        .parse_into::<proto::NetworkAcknowledgement>()?;
-    println!("ack = {:?}", ack);
+    network.request_peers_of(id).await?;
 
     let mut stop = network.stop_rx();
 

@@ -4,6 +4,7 @@ use core::fmt;
 use futures::{Future, FutureExt, SinkExt, StreamExt};
 use secp256k1::SecretKey;
 use std::collections::HashMap;
+use std::time::Duration;
 use tmq::{dealer::Dealer, Multipart};
 use tokio::sync::broadcast;
 use tokio::{
@@ -62,6 +63,7 @@ pub struct Network {
     command_tx: mpsc::UnboundedSender<NetworkCommand>,
     update_tx: mpsc::UnboundedSender<NetworkEvent>,
     stop_tx: broadcast::Sender<()>,
+    update_rx: Option<mpsc::UnboundedReceiver<NetworkEvent>>,
 }
 
 pub struct Connection {
@@ -71,8 +73,8 @@ pub struct Connection {
     task: Option<JoinHandle<()>>,
 }
 
-const PUBLIC_ENDPOINT: &str = "tcp://127.0.0.1:8801";
-// const PUBLIC_ENDPOINT: &str = "tcp://71.207.151.214:8800";
+// const PUBLIC_ENDPOINT: &str = "tcp://127.0.0.1:8801";
+const PUBLIC_ENDPOINT: &str = "tcp://71.207.151.214:8801";
 
 // type RecvFuture<'a, S = Dealer> = Next<'a, S>;
 
@@ -249,9 +251,11 @@ impl Connection {
                                         );
                                     }
                                     MessageType::GossipGetPeersResponse => {
-                                        let response = message.content.parse_into::<proto::GetPeersResponse>().unwrap();
+                                        let response = message
+                                            .content
+                                            .parse_into::<proto::GetPeersResponse>()
+                                            .unwrap();
                                         println!("Peers response = {:?}", response);
-                                        
                                     }
                                     msg => println!("unhandled message type {:?}", msg),
                                 }
@@ -403,7 +407,6 @@ impl Network {
         let _task = tokio::spawn(async move {
             let mut recv_sock = recv_sock;
             let mut command_rx = command_rx;
-            let mut update_rx = update_rx;
             let mut stop_rx = stop_rx;
 
             loop {
@@ -413,9 +416,6 @@ impl Network {
                     }
                     command = command_rx.recv() => {
                         println!("Got command: {:?}", command);
-                    }
-                    event = update_rx.recv() => {
-                        println!("Got event: {:?}", event);
                     }
                     _ = tokio::signal::ctrl_c() => {
                         println!("Got ctrl c");
@@ -436,7 +436,24 @@ impl Network {
             command_tx,
             update_tx,
             stop_tx,
+            update_rx: Some(update_rx),
         })
+    }
+
+    pub async fn with_seeds<'a, S>(
+        secret_key: SecretKey,
+        seeds: impl IntoIterator<Item = S>,
+    ) -> Result<Self>
+    where
+        S: AsRef<str>,
+    {
+        let mut network = Self::new(secret_key)?;
+
+        for seed in seeds {
+            network.connect_to(seed).await?;
+        }
+
+        Ok(network)
     }
 
     pub fn make_sender(&self) -> mpsc::UnboundedSender<NetworkCommand> {
@@ -476,6 +493,28 @@ impl Network {
         connection_id: ConnectionId,
     ) -> Result<()> {
         self.send_once(message_type, message.to_bytes(), connection_id)
+    }
+
+    pub async fn request_peers_of(&self, connection_id: ConnectionId) -> Result<()> {
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            self.send_request(
+                MessageType::GossipGetPeersRequest,
+                proto::GetPeersRequest::default().to_bytes(),
+                connection_id,
+            )?,
+        )
+        .await??;
+
+        println!("RESPONSE = {:?}", response);
+
+        let _ = response
+            .content
+            .parse_into::<proto::NetworkAcknowledgement>()?;
+
+        println!("Got ACK");
+
+        Ok(())
     }
 
     pub async fn connect_to(&mut self, endpoint: impl AsRef<str>) -> Result<ConnectionId> {
@@ -565,6 +604,10 @@ impl Network {
         let id = connection.id;
         self.connections.insert(id, connection);
         Ok(id)
+    }
+
+    pub fn take_update_rx(&mut self) -> Option<mpsc::UnboundedReceiver<NetworkEvent>> {
+        self.update_rx.take()
     }
 
     pub fn stop_tx(&self) -> broadcast::Sender<()> {
