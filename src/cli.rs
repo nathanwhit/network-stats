@@ -1,4 +1,4 @@
-use clap::{AppSettings, Parser};
+use clap::Parser;
 
 #[derive(Parser)]
 #[clap(version = clap::crate_version!(), author = clap::crate_authors!())]
