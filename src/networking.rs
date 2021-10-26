@@ -3,6 +3,7 @@ use crate::ext::{BufExt, MessageExt, ResultExt};
 use crate::proto::{self, message::MessageType};
 use crate::CreditcoinNode;
 use core::fmt;
+use dashmap::DashMap;
 use futures::{Future, FutureExt, SinkExt, StreamExt};
 use secp256k1::SecretKey;
 use std::collections::HashMap;
@@ -61,7 +62,7 @@ impl ConnectionId {
 pub struct Network {
     context: tmq::Context,
     secret_key: SecretKey,
-    connections: HashMap<ConnectionId, Connection>,
+    connections: DashMap<ConnectionId, Connection>,
     command_tx: mpsc::UnboundedSender<NetworkCommand>,
     update_tx: mpsc::UnboundedSender<NetworkEvent>,
     stop_tx: broadcast::Sender<()>,
@@ -151,6 +152,7 @@ impl Connection {
                     }
                     _ = stop_rx.recv() => {
                         log::debug!("stopping connection to {}", endpoint);
+                        drop(update_tx);
                         let message_bytes = proto::Message {
                             message_type: MessageType::NetworkDisconnect.into(),
                             content: proto::DisconnectMessage::default().to_bytes(),
@@ -400,7 +402,10 @@ impl Connection {
 }
 
 #[derive(Debug)]
-pub enum NetworkCommand {}
+pub enum NetworkCommand {
+    ConnectToNode { endpoint: String },
+    RequestPeers {},
+}
 
 #[derive(Debug)]
 pub enum NetworkEvent {
@@ -452,7 +457,7 @@ impl Network {
         Ok(Self {
             context,
             secret_key,
-            connections: HashMap::default(),
+            connections: DashMap::default(),
             command_tx,
             update_tx,
             stop_tx,
@@ -462,7 +467,7 @@ impl Network {
     }
 
     pub async fn with_options(secret_key: SecretKey, opts: &CliOptions) -> Result<Self> {
-        let mut network = Self::new(secret_key, opts.bind_address(), opts.endpoint())?;
+        let network = Self::new(secret_key, opts.bind_address(), opts.endpoint())?;
 
         for seed in &opts.seeds {
             network.connect_to(seed).await?;
@@ -532,7 +537,7 @@ impl Network {
         Ok(())
     }
 
-    pub async fn connect_to(&mut self, endpoint: impl AsRef<str>) -> Result<ConnectionId> {
+    pub async fn connect_to(&self, endpoint: impl AsRef<str>) -> Result<ConnectionId> {
         let connection = Connection::create(
             endpoint,
             &self.context,
@@ -631,5 +636,9 @@ impl Network {
 
     pub fn stop_rx(&self) -> broadcast::Receiver<()> {
         self.stop_tx.subscribe()
+    }
+
+    pub fn command_tx(&self) -> mpsc::UnboundedSender<NetworkCommand> {
+        self.command_tx.clone()
     }
 }
