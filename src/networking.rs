@@ -1,5 +1,7 @@
-use crate::ext::{BufExt, MessageExt};
+use crate::cli::CliOptions;
+use crate::ext::{BufExt, MessageExt, ResultExt};
 use crate::proto::{self, message::MessageType};
+use crate::CreditcoinNode;
 use core::fmt;
 use futures::{Future, FutureExt, SinkExt, StreamExt};
 use secp256k1::SecretKey;
@@ -64,6 +66,7 @@ pub struct Network {
     update_tx: mpsc::UnboundedSender<NetworkEvent>,
     stop_tx: broadcast::Sender<()>,
     update_rx: Option<mpsc::UnboundedReceiver<NetworkEvent>>,
+    public_endpoint: String,
 }
 
 pub struct Connection {
@@ -124,7 +127,9 @@ impl Connection {
 
         let internal_tx = tx.clone();
 
-        let task = tokio::spawn(async {
+        let this_endpoint = endpoint.clone();
+
+        let task = tokio::spawn(async move {
             let mut response_queue: ResponseQueue = HashMap::default();
             let mut queue = queue;
             let mut sock = sock;
@@ -132,6 +137,8 @@ impl Connection {
             let update_tx = update_tx;
             let mut stop_rx = stop_rx;
             let internal_tx = internal_tx;
+            let id = id.clone();
+            let endpoint = this_endpoint;
 
             loop {
                 tokio::select! {
@@ -139,11 +146,11 @@ impl Connection {
                         Self::handle_command(message, &mut sock, &mut response_queue).await;
                     }
                     incoming = sock.next() => {
-                        println!("incoming {:?}", incoming);
-                        Self::handle_message(incoming, &mut response_queue, &internal_tx, &command_tx, &update_tx).await;
+                        log::trace!("incoming {:?}", incoming);
+                        Self::handle_message(incoming, &mut response_queue, &internal_tx, &command_tx, &update_tx, &endpoint, id).await;
                     }
                     _ = stop_rx.recv() => {
-                        println!("stopping connection");
+                        log::debug!("stopping connection to {}", endpoint);
                         let message_bytes = proto::Message {
                             message_type: MessageType::NetworkDisconnect.into(),
                             content: proto::DisconnectMessage::default().to_bytes(),
@@ -174,11 +181,13 @@ impl Connection {
         command_sender: &mpsc::UnboundedSender<Command>,
         network_command_sender: &mpsc::UnboundedSender<NetworkCommand>,
         network_update_sender: &mpsc::UnboundedSender<NetworkEvent>,
+        this_endpoint: &str,
+        this_id: ConnectionId,
     ) {
         match message {
             Some(Ok(mut message)) => {
                 if message.len() > 1 {
-                    println!("Message longer than expected");
+                    log::warn!("Message longer than expected");
                 }
                 if let Some(frame) = message.pop_back() {
                     let message = proto::Message::try_parse(&*frame);
@@ -186,20 +195,18 @@ impl Connection {
                         Ok(message) => {
                             if let Some(tx) = response_queue.remove(&message.correlation_id) {
                                 if let Err(e) = tx.send(message) {
-                                    println!("Failed to send response over channel: {:?}", e)
+                                    log::error!("Failed to send response over channel: {:?}", e)
                                 }
                             } else {
-                                println!("Non-response message! {:?}", message);
+                                log::trace!("Non-response message! {:?}", message);
                                 let _send_once_and_log =
                                     |message_type: MessageType, data: Vec<u8>| {
-                                        let result = Connection::send_once_with(
+                                        Connection::send_once_with(
                                             message_type,
                                             data,
                                             &command_sender,
-                                        );
-                                        if let Err(e) = result {
-                                            println!("Error occurred : {:?}", e);
-                                        }
+                                        )
+                                        .log_err();
                                     };
 
                                 let send_response_and_log =
@@ -209,16 +216,14 @@ impl Connection {
                                             data,
                                             &message.correlation_id,
                                             &command_sender,
-                                        );
-                                        if let Err(e) = result {
-                                            println!("Error occurred : {:?}", e);
-                                        }
+                                        )
+                                        .log_err();
                                     };
                                 match message.message_type() {
                                     MessageType::NetworkConnect => {
                                         let connect_request: proto::ConnectionRequest =
                                             message.content.parse_into().unwrap();
-                                        println!("connect request = {:?}", connect_request);
+                                        log::debug!("connect request = {:?}", connect_request);
                                         let response = proto::ConnectionResponse {
                                             status: proto::connection_response::Status::Ok
                                                 .into(),
@@ -234,7 +239,7 @@ impl Connection {
                                             .content
                                             .parse_into::<proto::PingRequest>()
                                             .unwrap();
-                                        println!("ping request = {:?}", ping_request);
+                                        log::trace!("ping request = {:?}", ping_request);
                                         send_response_and_log(
                                             MessageType::PingResponse,
                                             proto::PingResponse::default().to_bytes(),
@@ -244,7 +249,7 @@ impl Connection {
                                         let response = proto::AuthorizationTrustResponse {
                                             roles: vec![proto::RoleType::Network.into()],
                                         };
-                                        println!("Sending response {:?}", response);
+                                        log::trace!("Sending response {:?}", response);
                                         send_response_and_log(
                                             MessageType::AuthorizationTrustResponse,
                                             response.to_bytes(),
@@ -255,23 +260,29 @@ impl Connection {
                                             .content
                                             .parse_into::<proto::GetPeersResponse>()
                                             .unwrap();
-                                        println!("Peers response = {:?}", response);
+                                        let peers = response.peer_endpoints;
+                                        let node = crate::CreditcoinNode {
+                                            endpoint: this_endpoint.to_owned(),
+                                        };
+                                        network_update_sender
+                                            .send(NetworkEvent::DiscoveredPeers { node, peers })
+                                            .log_err();
                                     }
-                                    msg => println!("unhandled message type {:?}", msg),
+                                    msg => log::warn!("unhandled message type {:?}", msg),
                                 }
                             }
                         }
                         Err(e) => {
-                            println!("Failed to parse message: {:?}", e);
+                            log::error!("Failed to parse message: {:?}", e);
                         }
                     }
                 }
             }
             Some(Err(e)) => {
-                println!("tmq error: {}", e);
+                log::error!("tmq error: {}", e);
             }
             None => {
-                println!("No message");
+                log::warn!("No message");
             }
         }
     }
@@ -289,7 +300,7 @@ impl Connection {
                 match sock.send(message).await {
                     Ok(()) => {}
                     Err(e) => {
-                        println!("Error sending message: {:?}", e)
+                        log::error!("Error sending message: {:?}", e)
                     }
                 }
                 if let Some(ResponseDemand { correlation_id, tx }) = response_demand {
@@ -313,7 +324,7 @@ impl Connection {
             content: data,
         };
 
-        println!("sending message {:?}", message);
+        log::trace!("sending message {:?}", message);
 
         let message_bytes = message.to_bytes();
         let message = vec![&message_bytes].into();
@@ -392,12 +403,21 @@ impl Connection {
 pub enum NetworkCommand {}
 
 #[derive(Debug)]
-pub enum NetworkEvent {}
+pub enum NetworkEvent {
+    DiscoveredPeers {
+        node: CreditcoinNode,
+        peers: Vec<String>,
+    },
+}
 
 impl Network {
-    pub fn new(secret_key: SecretKey) -> Result<Self> {
+    pub fn new(
+        secret_key: SecretKey,
+        bind: impl AsRef<str>,
+        endpoint: impl AsRef<str>,
+    ) -> Result<Self> {
         let context = tmq::Context::new();
-        let recv_sock = tmq::router(&context).bind("tcp://0.0.0.0:8801")?;
+        let recv_sock = tmq::router(&context).bind(bind.as_ref())?;
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (update_tx, update_rx) = mpsc::unbounded_channel();
 
@@ -412,17 +432,17 @@ impl Network {
             loop {
                 tokio::select! {
                     incoming = recv_sock.next() => {
-                        println!("Got message on router: {:?}", incoming);
+                        log::debug!("Got message on router: {:?}", incoming);
                     }
                     command = command_rx.recv() => {
-                        println!("Got command: {:?}", command);
+                        log::debug!("Got command: {:?}", command);
                     }
                     _ = tokio::signal::ctrl_c() => {
-                        println!("Got ctrl c");
+                        log::debug!("Got ctrl c");
                         my_stop_tx.send(()).unwrap();
                     }
                     _ = stop_rx.recv() => {
-                        println!("Stopping");
+                        log::debug!("Stopping");
                         break;
                     }
                 }
@@ -436,20 +456,15 @@ impl Network {
             command_tx,
             update_tx,
             stop_tx,
+            public_endpoint: endpoint.as_ref().to_owned(),
             update_rx: Some(update_rx),
         })
     }
 
-    pub async fn with_seeds<'a, S>(
-        secret_key: SecretKey,
-        seeds: impl IntoIterator<Item = S>,
-    ) -> Result<Self>
-    where
-        S: AsRef<str>,
-    {
-        let mut network = Self::new(secret_key)?;
+    pub async fn with_options(secret_key: SecretKey, opts: &CliOptions) -> Result<Self> {
+        let mut network = Self::new(secret_key, opts.bind_address(), opts.endpoint())?;
 
-        for seed in seeds {
+        for seed in &opts.seeds {
             network.connect_to(seed).await?;
         }
 
@@ -497,7 +512,7 @@ impl Network {
 
     pub async fn request_peers_of(&self, connection_id: ConnectionId) -> Result<()> {
         let response = tokio::time::timeout(
-            Duration::from_secs(2),
+            Duration::from_secs(30),
             self.send_request(
                 MessageType::GossipGetPeersRequest,
                 proto::GetPeersRequest::default().to_bytes(),
@@ -506,13 +521,13 @@ impl Network {
         )
         .await??;
 
-        println!("RESPONSE = {:?}", response);
+        log::trace!("RESPONSE = {:?}", response);
 
         let _ = response
             .content
             .parse_into::<proto::NetworkAcknowledgement>()?;
 
-        println!("Got ACK");
+        log::trace!("Got ACK");
 
         Ok(())
     }
@@ -526,7 +541,7 @@ impl Network {
             self.stop_tx.subscribe(),
         )?;
         let connect_request = proto::ConnectionRequest {
-            endpoint: PUBLIC_ENDPOINT.into(),
+            endpoint: self.public_endpoint.clone(),
         };
 
         let reply =
@@ -538,9 +553,9 @@ impl Network {
                     reply.message_type(),
                     MessageType::AuthorizationConnectionResponse
                 );
-                println!("{:?}", reply);
+                log::trace!("{:?}", reply);
                 let response = proto::ConnectionResponse::try_parse(&reply.content)?;
-                println!("{:?}", response);
+                log::trace!("{:?}", response);
 
                 let mut trust_roles = Vec::new();
                 let mut challenge_roles = Vec::new();
@@ -575,10 +590,10 @@ impl Network {
                                 response.message_type(),
                                 MessageType::AuthorizationTrustResponse
                             );
-                            println!("Trust request response: {:?}", response);
+                            log::trace!("Trust request response: {:?}", response);
                         }
                         Err(e) => {
-                            println!("error: {:?}", e)
+                            log::error!("error: {:?}", e)
                         }
                     }
                 }
@@ -595,7 +610,7 @@ impl Network {
                         response.message_type(),
                         MessageType::AuthorizationChallengeResponse
                     );
-                    println!("Challenge request response: {:?}", response);
+                    log::trace!("Challenge request response: {:?}", response);
                 }
             }
             Err(e) => return Err(eyre!("Got no response to connection request: {}", e)),

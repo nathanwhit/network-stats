@@ -21,6 +21,25 @@ where
     }
 }
 
+pub trait ResultExt: Sized {
+    type Output;
+    fn log_err(self) -> Self::Output;
+}
+
+impl<T, E> ResultExt for Result<T, E>
+where
+    E: std::fmt::Display,
+{
+    type Output = ();
+
+    fn log_err(self) {
+        match self {
+            Ok(_) => {}
+            Err(err) => log::error!("Error occurred: {}", err),
+        }
+    }
+}
+
 impl<M: Message + Default> MessageExt<M> for M {
     fn try_parse<B: AsRef<[u8]>>(buf: B) -> color_eyre::Result<M> {
         M::decode(buf.as_ref()).map_err(Into::into)
