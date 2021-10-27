@@ -1,6 +1,7 @@
 use core::fmt;
 use std::collections::{HashSet, VecDeque};
 use std::hash::Hash;
+use std::sync::Arc;
 
 use clap::Parser;
 
@@ -9,7 +10,6 @@ use petgraph::graphmap::UnGraphMap;
 use petgraph_graphml::GraphMl;
 
 use color_eyre::Result;
-use tokio::sync::mpsc;
 
 use crate::cli::CliOptions;
 use crate::ext::ResultExt;
@@ -62,7 +62,7 @@ async fn main() -> Result<()> {
         .map(CreditcoinNode::from)
         .collect();
 
-    let mut network = Network::with_options(key, &opts).await?;
+    let network = Arc::new(Network::with_options(key, &opts).await?);
 
     let mut updates = network.take_update_rx().unwrap();
 
@@ -83,13 +83,16 @@ async fn main() -> Result<()> {
                 log::warn!("Stopping main loop");
                 break 'a;
             }
-            match network.connect_to(&*node.endpoint).await {
-                Ok(node_id) => {
-                    log::debug!("requesting peers");
-                    network.request_peers_of(node_id).await.log_err();
+            let network = Arc::clone(&network);
+            tokio::spawn(async move {
+                match network.connect_to(&*node.endpoint).await {
+                    Ok(node_id) => {
+                        log::debug!("requesting peers");
+                        network.request_peers_of(node_id).await.log_err();
+                    }
+                    Err(e) => log::error!("failed to connect to {}: {}", &node, e),
                 }
-                Err(e) => log::error!("failed to connect to {}: {}", &node, e),
-            }
+            });
         }
         tokio::select! {
             _ = stop.recv() => {

@@ -1,5 +1,5 @@
 use crate::cli::CliOptions;
-use crate::ext::{BufExt, FutureExt, MessageExt, ResultExt};
+use crate::ext::{BufExt, MessageExt, ResultExt};
 use crate::proto::{self, message::MessageType};
 use crate::CreditcoinNode;
 use core::fmt;
@@ -8,8 +8,7 @@ use futures::{Future, FutureExt as _, SinkExt, StreamExt};
 use internment::Intern;
 use secp256k1::SecretKey;
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
 use tmq::{dealer::Dealer, Multipart};
 use tokio::sync::broadcast;
 use tokio::{
@@ -68,7 +67,7 @@ pub struct Network {
     command_tx: mpsc::UnboundedSender<NetworkCommand>,
     update_tx: mpsc::UnboundedSender<NetworkEvent>,
     stop_tx: broadcast::Sender<()>,
-    update_rx: Option<mpsc::UnboundedReceiver<NetworkEvent>>,
+    update_rx: Mutex<Option<mpsc::UnboundedReceiver<NetworkEvent>>>,
     public_endpoint: String,
 }
 
@@ -122,7 +121,7 @@ impl Connection {
     ) -> Result<Connection> {
         let endpoint = endpoint.as_ref().to_owned();
         let id = ConnectionId::new();
-        let sock = tmq::dealer(context).connect(&endpoint)?;
+        let sock = tmq::dealer(context).set_linger(0).connect(&endpoint)?;
         let (tx, queue) = mpsc::unbounded_channel();
 
         let internal_tx = tx.clone();
@@ -421,7 +420,7 @@ impl Network {
         endpoint: impl AsRef<str>,
     ) -> Result<Self> {
         let context = tmq::Context::new();
-        let recv_sock = tmq::router(&context).bind(bind.as_ref())?;
+        let recv_sock = tmq::router(&context).set_linger(0).bind(bind.as_ref())?;
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (update_tx, update_rx) = mpsc::unbounded_channel();
 
@@ -465,7 +464,7 @@ impl Network {
             update_tx,
             stop_tx,
             public_endpoint: endpoint.as_ref().to_owned(),
-            update_rx: Some(update_rx),
+            update_rx: Mutex::new(Some(update_rx)),
         })
     }
 
@@ -519,15 +518,13 @@ impl Network {
     }
 
     pub async fn request_peers_of(&self, connection_id: ConnectionId) -> Result<()> {
-        let response = tokio::time::timeout(
-            Duration::from_secs(30),
-            self.send_request(
+        let response = self
+            .send_request(
                 MessageType::GossipGetPeersRequest,
                 proto::GetPeersRequest::default().to_bytes(),
                 connection_id,
-            )?,
-        )
-        .await??;
+            )?
+            .await?;
 
         log::trace!("RESPONSE = {:?}", response);
 
@@ -555,8 +552,8 @@ impl Network {
         let reply =
             connection.send_request(MessageType::NetworkConnect, connect_request.to_bytes())?;
 
-        match reply.timeout(Duration::from_secs(30)).await {
-            Ok(Ok(reply)) => {
+        match reply.await {
+            Ok(reply) => {
                 ensure_message_type!(
                     reply.message_type(),
                     MessageType::AuthorizationConnectionResponse
@@ -590,22 +587,18 @@ impl Network {
                             MessageType::AuthorizationTrustRequest,
                             trust_request.to_bytes(),
                         )?
-                        .timeout(Duration::from_secs(10))
                         .await;
 
                     match response {
-                        Ok(Ok(response)) => {
+                        Ok(response) => {
                             ensure_message_type!(
                                 response.message_type(),
                                 MessageType::AuthorizationTrustResponse
                             );
                             log::trace!("Trust request response: {:?}", response);
                         }
-                        Ok(Err(e)) => {
-                            log::error!("error occurred making authorization trust request: {}", e)
-                        }
                         Err(e) => {
-                            log::error!("timed out waiting for trust response: {:?}", e)
+                            log::error!("error occurred making authorization trust request: {}", e)
                         }
                     }
                 }
@@ -625,8 +618,7 @@ impl Network {
                     log::trace!("Challenge request response: {:?}", response);
                 }
             }
-            Err(e) => return Err(eyre!("Timed out while waiting for response: {}", e)),
-            Ok(Err(e)) => return Err(eyre!("Got no response to connection request: {}", e)),
+            Err(e) => return Err(eyre!("Got no response to connection request: {}", e)),
         }
 
         let id = connection.id;
@@ -634,8 +626,8 @@ impl Network {
         Ok(id)
     }
 
-    pub fn take_update_rx(&mut self) -> Option<mpsc::UnboundedReceiver<NetworkEvent>> {
-        self.update_rx.take()
+    pub fn take_update_rx(&self) -> Option<mpsc::UnboundedReceiver<NetworkEvent>> {
+        self.update_rx.lock().unwrap().take()
     }
 
     pub fn stop_tx(&self) -> broadcast::Sender<()> {
