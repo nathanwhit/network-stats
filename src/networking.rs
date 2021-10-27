@@ -1,12 +1,14 @@
 use crate::cli::CliOptions;
-use crate::ext::{BufExt, MessageExt, ResultExt};
+use crate::ext::{BufExt, FutureExt, MessageExt, ResultExt};
 use crate::proto::{self, message::MessageType};
 use crate::CreditcoinNode;
 use core::fmt;
 use dashmap::DashMap;
-use futures::{Future, FutureExt, SinkExt, StreamExt};
+use futures::{Future, FutureExt as _, SinkExt, StreamExt};
+use internment::Intern;
 use secp256k1::SecretKey;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 use tmq::{dealer::Dealer, Multipart};
 use tokio::sync::broadcast;
@@ -62,7 +64,7 @@ impl ConnectionId {
 pub struct Network {
     context: tmq::Context,
     secret_key: SecretKey,
-    connections: DashMap<ConnectionId, Connection>,
+    connections: Arc<DashMap<ConnectionId, Connection>>,
     command_tx: mpsc::UnboundedSender<NetworkCommand>,
     update_tx: mpsc::UnboundedSender<NetworkEvent>,
     stop_tx: broadcast::Sender<()>,
@@ -71,16 +73,13 @@ pub struct Network {
 }
 
 pub struct Connection {
+    #[allow(dead_code)]
     endpoint: String,
     id: ConnectionId,
     tx: mpsc::UnboundedSender<Command>,
+    #[allow(dead_code)]
     task: Option<JoinHandle<()>>,
 }
-
-// const PUBLIC_ENDPOINT: &str = "tcp://127.0.0.1:8801";
-const PUBLIC_ENDPOINT: &str = "tcp://71.207.151.214:8801";
-
-// type RecvFuture<'a, S = Dealer> = Next<'a, S>;
 
 #[derive(Debug)]
 pub enum Command {
@@ -128,7 +127,7 @@ impl Connection {
 
         let internal_tx = tx.clone();
 
-        let this_endpoint = endpoint.clone();
+        let this_endpoint = Intern::new(endpoint.clone());
 
         let task = tokio::spawn(async move {
             let mut response_queue: ResponseQueue = HashMap::default();
@@ -148,7 +147,7 @@ impl Connection {
                     }
                     incoming = sock.next() => {
                         log::trace!("incoming {:?}", incoming);
-                        Self::handle_message(incoming, &mut response_queue, &internal_tx, &command_tx, &update_tx, &endpoint, id).await;
+                        Self::handle_message(incoming, &mut response_queue, &internal_tx, &command_tx, &update_tx, endpoint, id).await;
                     }
                     _ = stop_rx.recv() => {
                         log::debug!("stopping connection to {}", endpoint);
@@ -181,10 +180,10 @@ impl Connection {
         message: Option<Result<Multipart, tmq::TmqError>>,
         response_queue: &mut ResponseQueue,
         command_sender: &mpsc::UnboundedSender<Command>,
-        network_command_sender: &mpsc::UnboundedSender<NetworkCommand>,
+        _network_command_sender: &mpsc::UnboundedSender<NetworkCommand>,
         network_update_sender: &mpsc::UnboundedSender<NetworkEvent>,
-        this_endpoint: &str,
-        this_id: ConnectionId,
+        this_endpoint: Intern<String>,
+        _this_id: ConnectionId,
     ) {
         match message {
             Some(Ok(mut message)) => {
@@ -213,7 +212,7 @@ impl Connection {
 
                                 let send_response_and_log =
                                     |message_type: MessageType, data: Vec<u8>| {
-                                        let result = Connection::send_response_with(
+                                        Connection::send_response_with(
                                             message_type,
                                             data,
                                             &message.correlation_id,
@@ -428,12 +427,16 @@ impl Network {
 
         let (stop_tx, stop_rx) = broadcast::channel(10);
 
+        let connections = Arc::new(DashMap::new());
+
+        let connections_task = Arc::clone(&connections);
+
         let my_stop_tx = stop_tx.clone();
         let _task = tokio::spawn(async move {
             let mut recv_sock = recv_sock;
             let mut command_rx = command_rx;
             let mut stop_rx = stop_rx;
-
+            let _connections_task = connections_task;
             loop {
                 tokio::select! {
                     incoming = recv_sock.next() => {
@@ -457,7 +460,7 @@ impl Network {
         Ok(Self {
             context,
             secret_key,
-            connections: DashMap::default(),
+            connections,
             command_tx,
             update_tx,
             stop_tx,
@@ -552,8 +555,8 @@ impl Network {
         let reply =
             connection.send_request(MessageType::NetworkConnect, connect_request.to_bytes())?;
 
-        match reply.await {
-            Ok(reply) => {
+        match reply.timeout(Duration::from_secs(30)).await {
+            Ok(Ok(reply)) => {
                 ensure_message_type!(
                     reply.message_type(),
                     MessageType::AuthorizationConnectionResponse
@@ -587,18 +590,22 @@ impl Network {
                             MessageType::AuthorizationTrustRequest,
                             trust_request.to_bytes(),
                         )?
+                        .timeout(Duration::from_secs(10))
                         .await;
 
                     match response {
-                        Ok(response) => {
+                        Ok(Ok(response)) => {
                             ensure_message_type!(
                                 response.message_type(),
                                 MessageType::AuthorizationTrustResponse
                             );
                             log::trace!("Trust request response: {:?}", response);
                         }
+                        Ok(Err(e)) => {
+                            log::error!("error occurred making authorization trust request: {}", e)
+                        }
                         Err(e) => {
-                            log::error!("error: {:?}", e)
+                            log::error!("timed out waiting for trust response: {:?}", e)
                         }
                     }
                 }
@@ -618,7 +625,8 @@ impl Network {
                     log::trace!("Challenge request response: {:?}", response);
                 }
             }
-            Err(e) => return Err(eyre!("Got no response to connection request: {}", e)),
+            Err(e) => return Err(eyre!("Timed out while waiting for response: {}", e)),
+            Ok(Err(e)) => return Err(eyre!("Got no response to connection request: {}", e)),
         }
 
         let id = connection.id;
