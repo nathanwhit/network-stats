@@ -20,6 +20,12 @@ pub struct CliOptions {
 
     #[clap(long)]
     pub graphml: Option<String>,
+
+    #[clap(long)]
+    pub json: Option<String>,
+
+    #[clap(long)]
+    pub server: Option<String>,
 }
 
 impl CliOptions {
