@@ -10,18 +10,18 @@ use std::time::Duration;
 use clap::Parser;
 
 use dashmap::DashMap;
-use futures::{Future, SinkExt, StreamExt};
+use futures::{Future, SinkExt, Stream, StreamExt, TryFutureExt};
+use hyper::{Body, Request, Response};
 use internment::Intern;
 use petgraph::graph::NodeIndex;
-use petgraph::graphmap::UnGraphMap;
 use petgraph::stable_graph::StableUnGraph;
 use petgraph_graphml::GraphMl;
 
-use color_eyre::Result;
-use pin_project::pin_project;
+use color_eyre::{Report, Result};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, RwLock};
-use tokio_tungstenite::tungstenite::Message;
+use tokio_rustls::server::TlsStream;
+use tokio_rustls::TlsAcceptor;
 
 use crate::cli::CliOptions;
 use crate::ext::{FutureExt, ResultExt};
@@ -60,97 +60,37 @@ impl fmt::Display for CreditcoinNode {
     }
 }
 
+struct HyperAcceptor<'a> {
+    acceptor: Pin<
+        Box<dyn futures::Stream<Item = Result<TlsStream<TcpStream>, std::io::Error>> + Send + 'a>,
+    >,
+}
+
+impl hyper::server::accept::Accept for HyperAcceptor<'_> {
+    type Conn = TlsStream<TcpStream>;
+    type Error = std::io::Error;
+
+    fn poll_accept(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<Self::Conn, Self::Error>>> {
+        Pin::new(&mut self.acceptor).poll_next(cx)
+    }
+}
+
 type NetworkTopology = Arc<RwLock<StableUnGraph<CreditcoinNode, ()>>>;
 
-async fn handle_connection(
-    stream: TcpStream,
-    addr: SocketAddr,
-    mut stop: broadcast::Receiver<()>,
+async fn topology_request(
+    _req: Request<Body>,
     topology: NetworkTopology,
-) -> Result<()> {
-    let mut ws_stream = tokio_tungstenite::accept_async(stream).await?;
-
-    log::debug!("Websocket connection established: {}", addr);
-    loop {
-        tokio::select! {
-            _ = stop.recv() => {
-                log::debug!("Stopping websocket handler");
-                break;
-            }
-            msg = ws_stream.next() => {
-                match msg {
-                    Some(msg) => match msg {
-                        Ok(msg) => match msg {
-                            Message::Ping(ping) => ws_stream.send(Message::Pong(ping)).await.log_err(),
-                            Message::Pong(_) => {},
-                            Message::Text(s) => {
-                                log::debug!("received message from websocket stream: {}", s);
-                                if s == "update" {
-                                    let graph = json::Graph::new(&*topology.read().await);
-                                    let json = serde_json::to_string(&graph)?;
-                                    ws_stream.send(Message::Text(json)).await.log_err();
-                                }
-                            },
-                            Message::Close(close) => {
-                                log::debug!("Received close from websocket: {:?}", close);
-                                break;
-                            },
-                            Message::Binary(b) => {
-                                log::warn!("received unexpected binary message from websocket: {:?}", b);
-                            }
-                        }
-                        Err(e) => log::error!("received error from websocket stream: {}", e)
-                    }
-                    None => break,
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-#[derive(Debug)]
-enum Listener {
-    Enabled(TcpListener),
-    Disabled,
-}
-
-#[pin_project(project = MaybeStreamProj)]
-enum MaybeStream<'a> {
-    Stream(Pin<Box<dyn Future<Output = tokio::io::Result<(TcpStream, SocketAddr)>> + 'a>>),
-    Empty,
-}
-
-impl<'a> Future for MaybeStream<'a> {
-    type Output = tokio::io::Result<(TcpStream, SocketAddr)>;
-
-    fn poll(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
-        match self.project() {
-            MaybeStreamProj::Stream(s) => s.as_mut().poll(cx),
-            MaybeStreamProj::Empty => std::task::Poll::Pending,
-        }
-    }
-}
-
-impl Listener {
-    async fn new(opts: &CliOptions) -> Result<Self> {
-        if let Some(addr) = &opts.server {
-            Ok(Listener::Enabled(TcpListener::bind(addr).await?))
-        } else {
-            Ok(Listener::Disabled)
-        }
-    }
-
-    fn accept(&self) -> MaybeStream<'_> {
-        match self {
-            Listener::Enabled(listener) => MaybeStream::Stream(Box::pin(listener.accept())),
-            Listener::Disabled => MaybeStream::Empty,
-        }
-    }
+) -> Result<Response<Body>> {
+    log::warn!("GOT REQUEST");
+    let graph = json::Graph::from(&*topology.read().await);
+    let json = serde_json::to_string(&graph)?;
+    let response = Response::builder()
+        .header(hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+        .body(Body::from(json))?;
+    Ok(response)
 }
 
 #[tokio::main]
@@ -185,7 +125,73 @@ async fn main() -> Result<()> {
 
     let topology = Arc::new(RwLock::new(topology));
 
-    let listener = Listener::new(&opts).await?;
+    let addr: SocketAddr = opts
+        .server
+        .unwrap_or_else(|| "127.0.0.1:4321".into())
+        .parse()?;
+
+    let topo_clone = topology.clone();
+    let make_service = hyper::service::make_service_fn(move |_| {
+        let topology = topo_clone.clone();
+
+        async move {
+            Ok::<_, Report>(hyper::service::service_fn(move |req| {
+                topology_request(req, topology.clone())
+            }))
+        }
+    });
+
+    let tls_config = {
+        let certfile = std::fs::File::open("127.0.0.1+2.pem")?;
+        let keyfile = std::fs::File::open("127.0.0.1+2-key.pem")?;
+
+        let mut cert_reader = std::io::BufReader::new(certfile);
+        let mut key_reader = std::io::BufReader::new(keyfile);
+
+        let certs = rustls_pemfile::certs(&mut cert_reader)?
+            .into_iter()
+            .map(tokio_rustls::rustls::Certificate)
+            .collect();
+        let mut keys: Vec<_> = rustls_pemfile::pkcs8_private_keys(&mut key_reader)?
+            .into_iter()
+            .map(tokio_rustls::rustls::PrivateKey)
+            .collect();
+
+        let mut cfg = tokio_rustls::rustls::ServerConfig::builder()
+            .with_safe_defaults()
+            .with_no_client_auth()
+            .with_single_cert(certs, keys.pop().unwrap())?;
+        cfg.alpn_protocols
+            .extend([b"h2".to_vec(), b"http/1.1".to_vec()]);
+        log::warn!("{:?}", cfg.alpn_protocols);
+        Arc::new(cfg)
+    };
+    let tcp = tokio::net::TcpListener::bind(&addr).await?;
+    let tls_acceptor = TlsAcceptor::from(tls_config);
+
+    let incoming_tls_stream = async_stream::stream! {
+        loop {
+            let (socket, _) = tcp.accept().await?;
+            match tls_acceptor.accept(socket).await {
+                Ok(stream) => yield Ok(stream),
+                Err(e) => log::error!("SSL Error: {}", e),
+            }
+        }
+    };
+
+    let server = hyper::Server::builder(HyperAcceptor {
+        acceptor: Box::pin(incoming_tls_stream),
+    })
+    .serve(make_service);
+    // let server = hyper::Server::bind(&addr).serve(make_service);
+
+    // let listener = Listener::new(&opts).await?;
+    let shutdown = server.with_graceful_shutdown({
+        let mut stop = network.stop_rx();
+        async move { stop.recv().await.log_err() }
+    });
+
+    tokio::spawn(shutdown);
 
     'a: loop {
         while let Some(node) = queue.pop_front() {
@@ -279,17 +285,17 @@ async fn main() -> Result<()> {
                 }
             }
 
-            conn = listener.accept() => {
-                log::info!("Got new connection");
-                match conn {
-                    Ok((stream, addr)) => {
-                        tokio::spawn(handle_connection(stream, addr, network.stop_rx(), topology.clone()));
-                    },
-                    Err(e) => {
-                        log::error!("Error on websocket stream: {}", e);
-                    }
-                }
-            }
+            // conn = listener.accept() => {
+            //     log::info!("Got new connection");
+            //     match conn {
+            //         Ok((stream, addr)) => {
+            //             tokio::spawn(handle_connection(stream, addr, network.stop_rx(), topology.clone()));
+            //         },
+            //         Err(e) => {
+            //             log::error!("Error on websocket stream: {}", e);
+            //         }
+            //     }
+            // }
         }
     }
 
