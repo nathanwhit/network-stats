@@ -263,11 +263,13 @@ impl Connection {
                                         let peers = response.peer_endpoints;
                                         let node = crate::CreditcoinNode {
                                             endpoint: this_endpoint.to_owned(),
+                                            tip: None,
                                         };
                                         network_update_sender
                                             .send(NetworkEvent::DiscoveredPeers { node, peers })
                                             .log_err();
                                     }
+                                    MessageType::ClientBlockListResponse => {}
                                     msg => log::warn!("unhandled message type {:?}", msg),
                                 }
                             }

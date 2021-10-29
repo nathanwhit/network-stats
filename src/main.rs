@@ -3,14 +3,13 @@ use std::collections::{HashSet, VecDeque};
 use std::hash::Hash;
 use std::net::SocketAddr;
 use std::ops::Deref;
-use std::pin::Pin;
+
 use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
 
 use dashmap::DashMap;
-use futures::{Future, SinkExt, Stream, StreamExt, TryFutureExt};
 use hyper::{Body, Request, Response};
 use internment::Intern;
 use petgraph::graph::NodeIndex;
@@ -18,10 +17,7 @@ use petgraph::stable_graph::StableUnGraph;
 use petgraph_graphml::GraphMl;
 
 use color_eyre::{Report, Result};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, RwLock};
-use tokio_rustls::server::TlsStream;
-use tokio_rustls::TlsAcceptor;
+use tokio::sync::RwLock;
 
 use crate::cli::CliOptions;
 use crate::ext::{FutureExt, ResultExt};
@@ -36,12 +32,14 @@ pub mod proto;
 #[derive(Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct CreditcoinNode {
     endpoint: Intern<String>,
+    tip: Option<u64>,
 }
 
 impl From<String> for CreditcoinNode {
     fn from(endpoint: String) -> Self {
         Self {
             endpoint: Intern::new(endpoint),
+            tip: None,
         }
     }
 }
@@ -60,24 +58,6 @@ impl fmt::Display for CreditcoinNode {
     }
 }
 
-struct HyperAcceptor<'a> {
-    acceptor: Pin<
-        Box<dyn futures::Stream<Item = Result<TlsStream<TcpStream>, std::io::Error>> + Send + 'a>,
-    >,
-}
-
-impl hyper::server::accept::Accept for HyperAcceptor<'_> {
-    type Conn = TlsStream<TcpStream>;
-    type Error = std::io::Error;
-
-    fn poll_accept(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Result<Self::Conn, Self::Error>>> {
-        Pin::new(&mut self.acceptor).poll_next(cx)
-    }
-}
-
 type NetworkTopology = Arc<RwLock<StableUnGraph<CreditcoinNode, ()>>>;
 
 async fn topology_request(
@@ -89,6 +69,7 @@ async fn topology_request(
     let json = serde_json::to_string(&graph)?;
     let response = Response::builder()
         .header(hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+        .header(hyper::header::CONTENT_TYPE, "application/json")
         .body(Body::from(json))?;
     Ok(response)
 }
@@ -127,7 +108,9 @@ async fn main() -> Result<()> {
 
     let addr: SocketAddr = opts
         .server
-        .unwrap_or_else(|| "127.0.0.1:4321".into())
+        .as_ref()
+        .map(|s| s.as_str())
+        .unwrap_or_else(|| "127.0.0.1:4321")
         .parse()?;
 
     let topo_clone = topology.clone();
@@ -141,57 +124,18 @@ async fn main() -> Result<()> {
         }
     });
 
-    let tls_config = {
-        let certfile = std::fs::File::open("127.0.0.1+2.pem")?;
-        let keyfile = std::fs::File::open("127.0.0.1+2-key.pem")?;
+    if opts.server.is_some() {
+        let server = hyper::Server::bind(&addr).serve(make_service);
+        // let server = hyper::Server::bind(&addr).serve(make_service);
 
-        let mut cert_reader = std::io::BufReader::new(certfile);
-        let mut key_reader = std::io::BufReader::new(keyfile);
+        // let listener = Listener::new(&opts).await?;
+        let shutdown = server.with_graceful_shutdown({
+            let mut stop = network.stop_rx();
+            async move { stop.recv().await.log_err() }
+        });
 
-        let certs = rustls_pemfile::certs(&mut cert_reader)?
-            .into_iter()
-            .map(tokio_rustls::rustls::Certificate)
-            .collect();
-        let mut keys: Vec<_> = rustls_pemfile::pkcs8_private_keys(&mut key_reader)?
-            .into_iter()
-            .map(tokio_rustls::rustls::PrivateKey)
-            .collect();
-
-        let mut cfg = tokio_rustls::rustls::ServerConfig::builder()
-            .with_safe_defaults()
-            .with_no_client_auth()
-            .with_single_cert(certs, keys.pop().unwrap())?;
-        cfg.alpn_protocols
-            .extend([b"h2".to_vec(), b"http/1.1".to_vec()]);
-        log::warn!("{:?}", cfg.alpn_protocols);
-        Arc::new(cfg)
-    };
-    let tcp = tokio::net::TcpListener::bind(&addr).await?;
-    let tls_acceptor = TlsAcceptor::from(tls_config);
-
-    let incoming_tls_stream = async_stream::stream! {
-        loop {
-            let (socket, _) = tcp.accept().await?;
-            match tls_acceptor.accept(socket).await {
-                Ok(stream) => yield Ok(stream),
-                Err(e) => log::error!("SSL Error: {}", e),
-            }
-        }
-    };
-
-    let server = hyper::Server::builder(HyperAcceptor {
-        acceptor: Box::pin(incoming_tls_stream),
-    })
-    .serve(make_service);
-    // let server = hyper::Server::bind(&addr).serve(make_service);
-
-    // let listener = Listener::new(&opts).await?;
-    let shutdown = server.with_graceful_shutdown({
-        let mut stop = network.stop_rx();
-        async move { stop.recv().await.log_err() }
-    });
-
-    tokio::spawn(shutdown);
+        tokio::spawn(shutdown);
+    }
 
     'a: loop {
         while let Some(node) = queue.pop_front() {

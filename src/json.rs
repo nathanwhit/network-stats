@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use petgraph::{graphmap::UnGraphMap, stable_graph::StableUnGraph};
+use petgraph::{stable_graph::StableUnGraph};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
