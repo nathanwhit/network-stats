@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use petgraph::graphmap::UnGraphMap;
+use petgraph::{graphmap::UnGraphMap, stable_graph::StableUnGraph};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -41,14 +41,14 @@ pub struct Options {
     typ: String,
 }
 
-impl From<&UnGraphMap<CreditcoinNode, ()>> for Graph<u64> {
-    fn from(graph: &UnGraphMap<CreditcoinNode, ()>) -> Self {
+impl From<&StableUnGraph<CreditcoinNode, ()>> for Graph<u64> {
+    fn from(graph: &StableUnGraph<CreditcoinNode, ()>) -> Self {
         let mut key = 0;
 
         let mut node_keys = HashMap::new();
 
         let nodes = graph
-            .nodes()
+            .node_weights()
             .map(|node| {
                 let k = key;
                 key += 1;
@@ -68,21 +68,30 @@ impl From<&UnGraphMap<CreditcoinNode, ()>> for Graph<u64> {
             .collect();
 
         let edges = graph
-            .all_edges()
-            .map(|(node1, node2, _)| Edge {
-                key: {
-                    let k = key;
-                    key += 1;
-                    Some(k)
-                },
-                source: *node_keys.get(&node1).unwrap(),
-                target: *node_keys.get(&node2).unwrap(),
-                attributes: Some(json! {
-                    {
-                        "size": 3,
+            .edge_indices()
+            .filter_map(|edge| {
+                if let Some((node1, node2)) = graph.edge_endpoints(edge) {
+                    if let Some(node1) = graph.node_weight(node1) {
+                        if let Some(node2) = graph.node_weight(node2) {
+                            return Some(Edge {
+                                key: {
+                                    let k = key;
+                                    key += 1;
+                                    Some(k)
+                                },
+                                source: *node_keys.get(&node1).unwrap(),
+                                target: *node_keys.get(&node2).unwrap(),
+                                attributes: Some(json! {
+                                    {
+                                        "size": 3,
+                                    }
+                                }),
+                                undirected: true,
+                            });
+                        }
                     }
-                }),
-                undirected: true,
+                }
+                None
             })
             .collect();
 
@@ -100,7 +109,7 @@ impl From<&UnGraphMap<CreditcoinNode, ()>> for Graph<u64> {
 }
 
 impl Graph<u64> {
-    pub fn new(graph: &UnGraphMap<CreditcoinNode, ()>) -> Self {
+    pub fn new(graph: &StableUnGraph<CreditcoinNode, ()>) -> Self {
         Self::from(graph)
     }
 }
